@@ -1,0 +1,130 @@
+name: Build WayyMusify APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        run: |
+          ls -la
+          if [ ! -f WayyMusify.zip ]; then
+            echo "ERROR: WayyMusify.zip not found in repo root"
+            exit 1
+          fi
+          unzip -o WayyMusify.zip
+          ls -la
+
+      - name: Set project dir
+        id: proj
+        run: |
+          if [ -f WayyMusify/settings.gradle.kts ]; then
+            echo "dir=WayyMusify" >> $GITHUB_OUTPUT
+          elif [ -f settings.gradle.kts ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          else
+            echo "Project not found"
+            find . -name settings.gradle.kts | head -20
+            exit 1
+          fi
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set +e
+          sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;35.0.0" "cmdline-tools;latest"
+          if [ $? -ne 0 ]; then
+            echo "android-37 failed, trying android-35..."
+            sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmdline-tools;latest"
+          fi
+          yes | sdkmanager --licenses || true
+
+      - name: Make gradlew executable
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        id: build
+        working-directory: ${{ steps.proj.outputs.dir }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease --stacktrace --no-daemon 2>&1 | tee /tmp/build_log.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
+
+      - name: Collect debug package (always)
+        if: always()
+        run: |
+          mkdir -p /tmp/debug_out
+          if [ -f /tmp/build_log.txt ]; then
+            cp /tmp/build_log.txt /tmp/debug_out/build_log.txt
+          else
+            echo "No build log captured" > /tmp/debug_out/build_log.txt
+          fi
+          {
+            echo "=== Java ==="
+            java -version 2>&1 || true
+            echo "=== Android SDK ==="
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+            ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
+            echo "=== Project tree (top) ==="
+            ls -la "${{ steps.proj.outputs.dir }}" 2>/dev/null || true
+            echo "=== settings.gradle.kts (first 80 lines) ==="
+            head -80 "${{ steps.proj.outputs.dir }}/settings.gradle.kts" 2>/dev/null || true
+            echo "=== Missing modules check ==="
+            for p in core lyrics/betterlyrics lyrics/kugou morideobfuscator lastfm canvas; do
+              if [ -d "${{ steps.proj.outputs.dir }}/$p" ]; then
+                echo "OK  $p"
+              else
+                echo "MISSING  $p"
+              fi
+            done
+          } > /tmp/debug_out/env_info.txt
+          if [ -d "${{ steps.proj.outputs.dir }}/build/reports" ]; then
+            cp -r "${{ steps.proj.outputs.dir }}/build/reports" /tmp/debug_out/ 2>/dev/null || true
+          fi
+          cd /tmp && zip -r debug_package.zip debug_out
+
+      - name: Upload debug ZIP (always — download if error)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayymusify-debug
+          path: /tmp/debug_package.zip
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload APKs (if build succeeded)
+        if: steps.build.outputs.exit_code == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayymusify-apks
+          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/**/*.apk
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail job if build failed
+        if: steps.build.outputs.exit_code != '0'
+        run: |
+          echo "Build failed. Download artifact 'wayymusify-debug' and send it."
+          exit 1
